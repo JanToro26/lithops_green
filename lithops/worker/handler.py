@@ -44,6 +44,8 @@ from lithops.utils import setup_lithops_logger, is_unix_system
 from lithops.worker.status import create_call_status
 from lithops.worker.utils import SystemMonitor
 
+from lithops.worker.energymonitor import EnergyManager
+
 pickling_support.install()
 
 logger = logging.getLogger(__name__)
@@ -196,8 +198,14 @@ def run_task(task):
         logger.debug(f'Runtime: {runtime_name} - Timeout: {timeout} seconds')
 
     job_interruped = False
+    
+    # Energy Manager initialization
+    em = EnergyManager()
 
     try:
+        # Energy Manager start
+        em.start()
+        
         # send init status event
         call_status.send_init_event()
 
@@ -212,7 +220,9 @@ def run_task(task):
 
         jrp.start()
         jrp.join(task.execution_timeout)
-
+        
+        # Energy Manager stop 
+        em.stop()  # Stop energy monitoring after jobrunner finishes or times out
         sys_monitor.stop()
         logger.debug('JobRunner process finished')
 
@@ -278,6 +288,20 @@ def run_task(task):
 
     finally:
         if not job_interruped:
+            
+            # Energy Manager stop (if not already stopped in the normal flow)
+            if em.end_time is None:
+                em.stop()  # Ensure energy monitoring is stopped if an Exception is caught before the normal stop
+                
+            energy_data = em.get_energy_data()
+
+            call_status.add('worker_func_energy_joules', energy_data['energy']['pkg'])
+            
+            # Energy data collection and addition to call status
+            call_status.add('worker_func_energy_joules', energy_data.get('energy', {}).get('pkg', 0.0))
+            call_status.add('worker_func_energy_cores_joules', energy_data.get('energy', {}).get('cores', 0.0))
+            call_status.add('worker_energy_source', energy_data.get('source', 'unknown'))
+            
             call_status.add('worker_end_tstamp', time.time())
 
             # Flush log stream and save it to the call status
