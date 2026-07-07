@@ -198,9 +198,14 @@ def run_task(task):
         logger.debug(f'Runtime: {runtime_name} - Timeout: {timeout} seconds')
 
     job_interruped = False
-    
-    # Energy Manager initialization
-    em = EnergyManager()
+
+    # Default cpu_info so the finally block never fails if an exception
+    # occurs before sys_monitor collects real metrics.
+    cpu_info = {'usage': [], 'user': 0.0, 'system': 0.0}
+
+    # Energy Manager initialization (needs the monitored process id)
+    process_id = os.getpid() if is_unix_system() else mp.current_process().pid
+    em = EnergyManager(process_id)
 
     try:
         # Energy Manager start
@@ -214,7 +219,6 @@ def run_task(task):
         logger.debug('Starting JobRunner process')
         jrp = Process(target=jobrunner.run) if is_unix_system() else Thread(target=jobrunner.run)
 
-        process_id = os.getpid() if is_unix_system() else mp.current_process().pid
         sys_monitor = SystemMonitor(process_id)
         sys_monitor.start()
 
@@ -289,19 +293,14 @@ def run_task(task):
     finally:
         if not job_interruped:
             
-            # Energy Manager stop (if not already stopped in the normal flow)
-            if em.end_time is None:
-                em.stop()  # Ensure energy monitoring is stopped if an Exception is caught before the normal stop
-                
-            energy_data = em.get_energy_data()
+            # Energy Manager stop (idempotent; ensures monitoring is stopped
+            # even if an Exception was caught before the normal stop)
+            em.stop()
 
-            call_status.add('worker_func_energy_joules', energy_data['energy']['pkg'])
-            
-            # Energy data collection and addition to call status
-            call_status.add('worker_func_energy_joules', energy_data.get('energy', {}).get('pkg', 0.0))
-            call_status.add('worker_func_energy_cores_joules', energy_data.get('energy', {}).get('cores', 0.0))
-            call_status.add('worker_energy_source', energy_data.get('source', 'unknown'))
-            
+            # Collect energy data from all monitors (rapl + psutil) and add the
+            # per-method fields to the call status.
+            em.process_energy_data(task, call_status, cpu_info)
+
             call_status.add('worker_end_tstamp', time.time())
 
             # Flush log stream and save it to the call status

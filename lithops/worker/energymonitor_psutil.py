@@ -393,8 +393,8 @@ class EnergyMonitor:
             return {'energy': {'pkg': 0, 'cores': 0}, 'duration': duration, 'source': 'none'}
 
         # Calculate average CPU usage from start/end samples
-        avg_cpu = (self.initial_metrics.get('cpu_percent', 0) + 
-                   self.final_metrics.get('cpu_percent', 0)) / 2.0
+        avg_cpu = (self.initial_metrics.get('system_cpu_percent', 0) +
+                   self.final_metrics.get('system_cpu_percent', 0)) / 2.0
         
         # Empirical Power Model
         # We assume 15% of TDP is base (Idle) and 85% is dynamic range
