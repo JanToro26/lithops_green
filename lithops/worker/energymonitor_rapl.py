@@ -2,7 +2,7 @@ import os
 import time
 import glob
 import logging
-#from .energymonitor_json_utils import store_energy_data_json, update_function_name
+from .energymonitor_json_utils import store_energy_data_json, update_function_name
 
 logger = logging.getLogger(__name__)
 
@@ -16,13 +16,18 @@ class EnergyMonitor:
         self.process_id = process_id
         self.start_time = None
         self.end_time = None
-        self.start_energy_pkg = None
-        self.start_energy_cores = None
-        self.end_energy_pkg = None
-        self.end_energy_cores = None
+        #self.start_energy_pkg = None
+        #self.start_energy_cores = None
+        #self.end_energy_pkg = None
+        #self.end_energy_cores = None
         self.function_name = None
         self.rapl_pkg_files = []
         self.rapl_cores_files = []
+        self.rapl_max_range = {}   # {ruta_energy_uj: max_energy_range_uj}
+        self.start_energy_pkg = {} # dictionaries to hold start and end energy readings for each file
+        self.start_energy_cores = {} # this way we can keep track of the real value even after a wrap-around
+        self.end_energy_pkg = {}
+        self.end_energy_cores = {}
         
         # Print directly to terminal for debugging
         print(f"\n==== RAPL ENERGY MONITOR INITIALIZED FOR PROCESS {process_id} ====")
@@ -48,6 +53,13 @@ class EnergyMonitor:
                     with open(file, 'r') as f:
                         value = f.read().strip()
                         int(value)  # Verify it's a valid number
+                        
+                    range_file = file.replace('energy_uj', 'max_energy_range_uj')
+                    try:
+                        with open(range_file, 'r') as f:
+                            self.rapl_max_range[file] = int(f.read().strip())
+                    except Exception:
+                        self.rapl_max_range[file] = None   # or a known default value
                     
                     # Determine if it's a package or core file
                     if ':0:' in file or file.endswith(':0/energy_uj'):
@@ -64,18 +76,17 @@ class EnergyMonitor:
         
         print(f"Total RAPL package files: {len(self.rapl_pkg_files)}")
         print(f"Total RAPL cores files: {len(self.rapl_cores_files)}")
-        
+            
     def _read_rapl_energy(self, files):
-        """Read energy from RAPL files and return total in microjoules."""
-        total_energy = 0
+        """Read energy from RAPL files and return a dict {file: microjoules}."""
+        readings = {}
         for file in files:
             try:
                 with open(file, 'r') as f:
-                    value = int(f.read().strip())
-                    total_energy += value
+                    readings[file] = int(f.read().strip())
             except Exception as e:
                 print(f"❌ Error reading {file}: {e}")
-        return total_energy
+        return readings
         
     def start(self):
         """Start monitoring energy consumption using RAPL."""
@@ -112,15 +123,20 @@ class EnergyMonitor:
             self.end_energy_pkg = self._read_rapl_energy(self.rapl_pkg_files)
             self.end_energy_cores = self._read_rapl_energy(self.rapl_cores_files)
             
+            pkg_diff   = self._compute_diff(self.start_energy_pkg,   self.end_energy_pkg)
+            cores_diff = self._compute_diff(self.start_energy_cores, self.end_energy_cores)
+            
             duration = self.end_time - self.start_time
             print(f"RAPL monitoring stopped at: {self.end_time}")
             print(f"Monitoring duration: {duration:.2f} seconds")
             print(f"Final package energy: {self.end_energy_pkg} microjoules")
             print(f"Final cores energy: {self.end_energy_cores} microjoules")
             
-            # Calculate energy differences
-            pkg_diff = self.end_energy_pkg - self.start_energy_pkg
-            cores_diff = self.end_energy_cores - self.start_energy_cores
+            # Calculate energy differences NOT NECESSARY ANYMORE since we compute the diff in _compute_diff for each file
+            # pkg_diff = self.end_energy_pkg - self.start_energy_pkg  
+            # if pkg_diff < 0:                                # Fixed to prevent negative values from overflow
+            #    pkg_diff += self.max_energy_range_pkg
+            #cores_diff = self.end_energy_cores - self.start_energy_cores
             
             print(f"Package energy consumed: {pkg_diff} microjoules ({pkg_diff / 1000000:.6f} Joules)")
             print(f"Cores energy consumed: {cores_diff} microjoules ({cores_diff / 1000000:.6f} Joules)")
@@ -128,6 +144,15 @@ class EnergyMonitor:
         except Exception as e:
             print(f"❌ Error stopping RAPL monitoring: {e}")
             
+    def _compute_diff(self, start_readings, end_readings):
+        total = 0
+        for file in end_readings:
+            diff = end_readings[file] - start_readings[file]
+            if diff < 0:
+                diff += self.rapl_max_range[file]
+            total += diff
+        return total
+
     def get_energy_data(self):
         """Get the collected energy data from RAPL."""
         print("\n==== GETTING RAPL ENERGY DATA ====")
@@ -143,11 +168,14 @@ class EnergyMonitor:
         duration = self.end_time - self.start_time
         
         # Calculate energy differences in Joules
-        pkg_energy_uj = self.end_energy_pkg - self.start_energy_pkg
-        cores_energy_uj = self.end_energy_cores - self.start_energy_cores
+        #pkg_energy_uj = self.end_energy_pkg - self.start_energy_pkg
+        #cores_energy_uj = self.end_energy_cores - self.start_energy_cores
+        pkg_energy_uj   = self._compute_diff(self.start_energy_pkg,   self.end_energy_pkg)
+        cores_energy_uj = self._compute_diff(self.start_energy_cores, self.end_energy_cores)
         
         pkg_energy_j = pkg_energy_uj / 1000000.0  # Convert microjoules to Joules
         cores_energy_j = cores_energy_uj / 1000000.0
+        
         
         # Calculate core percentage
         core_percentage = cores_energy_j / max(pkg_energy_j, 0.000001)

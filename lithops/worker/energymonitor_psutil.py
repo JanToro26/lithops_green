@@ -2,6 +2,7 @@ import os
 import time
 import logging
 import platform
+import threading
 
 logger = logging.getLogger(__name__)
 
@@ -20,6 +21,13 @@ class EnergyMonitor:
         self.function_name = None
         self.initial_metrics = {}
         self.final_metrics = {}
+
+        # --- Periodic process CPU sampling ---
+        self._proc = None
+        self._proc_samples = []
+        self._sampling = False
+        self._sampler_thread = None
+        self._sample_interval = 0.5
         
         # --- Hardware Discovery ---
         self.arch = platform.machine().lower() # e.g., 'x86_64' or 'aarch64'
@@ -40,6 +48,17 @@ class EnergyMonitor:
             # Initialize CPU percent measurement (non-blocking)
             psutil.cpu_percent(interval=None) 
             self.initial_metrics = self._collect_system_metrics()
+
+            try:
+                self._proc = psutil.Process(self.process_id)
+                self._proc.cpu_percent(None)
+            except Exception as e:
+                logger.debug(f"Could not attach to process {self.process_id}: {e}")
+                self._proc = None
+            self._proc_samples = []
+            self._sampling = True
+            self._sampler_thread = threading.Thread(target=self._sample_loop, daemon=True)
+            self._sampler_thread.start()
             
             logger.info("PSUtil system monitoring started successfully")
             return True
@@ -51,6 +70,17 @@ class EnergyMonitor:
             logger.error(f"Error starting PSUtil system monitoring: {e}")
             return False
             
+    def _sample_loop(self):
+        """Background loop: sample the process CPU% every _sample_interval seconds."""
+        while self._sampling:
+            try:
+                if self._proc is not None:
+                    val = self._proc.cpu_percent(interval=self._sample_interval)
+                    self._proc_samples.append(val)
+                else:
+                    time.sleep(self._sample_interval)
+            except Exception:
+                time.sleep(self._sample_interval)
     def stop(self):
         """Stop monitoring and collect final system metrics."""
         logger.debug("Stopping PSUtil system monitoring")
@@ -58,6 +88,10 @@ class EnergyMonitor:
         if self.start_time is None:
             logger.warning("PSUtil monitoring was not started")
             return
+
+        self._sampling = False
+        if self._sampler_thread is not None:
+            self._sampler_thread.join(timeout=self._sample_interval * 2 + 1)
             
         try:
             import psutil
@@ -387,14 +421,23 @@ class EnergyMonitor:
         Calculates estimated energy consumption using an empirical power model.
         Energy (J) = [P_idle + (P_dynamic * %CPU)] * Duration
         """
+        import psutil
         duration = self.end_time - self.start_time if self.start_time and self.end_time else 0
         
         if not self.final_metrics:
             return {'energy': {'pkg': 0, 'cores': 0}, 'duration': duration, 'source': 'none'}
 
-        # Calculate average CPU usage from start/end samples
-        avg_cpu = (self.initial_metrics.get('system_cpu_percent', 0) +
-                   self.final_metrics.get('system_cpu_percent', 0)) / 2.0
+        # Average process CPU% over the whole execution (periodic sampling).
+        if self._proc_samples:
+            raw_proc_cpu = sum(self._proc_samples) / len(self._proc_samples)
+        else:
+            raw_proc_cpu = (self.initial_metrics.get('system_cpu_percent', 0) +
+                            self.final_metrics.get('system_cpu_percent', 0)) / 2.0
+        try:
+            n_logical = psutil.cpu_count(logical=True) or 1
+        except Exception:
+            n_logical = 1
+        avg_cpu = min(100.0, raw_proc_cpu / n_logical)
         
         # Empirical Power Model
         # We assume 15% of TDP is base (Idle) and 85% is dynamic range
@@ -410,7 +453,9 @@ class EnergyMonitor:
             'energy': {
                 'pkg': round(energy_j, 6),
                 'cores': round(energy_j * 0.75, 6), # Core estimation (approx 75% of PKG)
-                'avg_cpu_percent': round(avg_cpu, 2)
+                'avg_cpu_percent': round(avg_cpu, 2),
+                'proc_cpu_percent': round(raw_proc_cpu, 2),
+                'cpu_samples': len(self._proc_samples)
             },
             'cpu_info': {
                 'model': self.cpu_model,
