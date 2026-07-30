@@ -156,6 +156,8 @@ class EnergyManager:
             'worker_func_psutil_energy_pkg': 0.0,
             'worker_func_psutil_energy_cores': 0.0,
             'worker_func_psutil_avg_cpu_percent': 0.0,
+            'worker_func_psutil_proc_cpu_percent': 0.0,
+            'worker_func_psutil_cpu_samples': 0,
             'worker_func_psutil_source': 'unavailable',
             'worker_func_psutil_available': False,
             'worker_func_psutil_cpu_model': 'Unknown',
@@ -194,6 +196,8 @@ class EnergyManager:
                         energy_fields['worker_func_psutil_energy_pkg'] = pkg_energy
                         energy_fields['worker_func_psutil_energy_cores'] = cores_energy
                         energy_fields['worker_func_psutil_avg_cpu_percent'] = energy.get('avg_cpu_percent', 0.0)
+                        energy_fields['worker_func_psutil_proc_cpu_percent'] = energy.get('proc_cpu_percent', 0.0)
+                        energy_fields['worker_func_psutil_cpu_samples'] = energy.get('cpu_samples', 0)
                         energy_fields['worker_func_psutil_source'] = source
                         energy_fields['worker_func_psutil_available'] = True
                         energy_fields['worker_func_psutil_cpu_model'] = cpu_info_data.get('model', 'Unknown')
