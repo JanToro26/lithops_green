@@ -83,13 +83,13 @@ def run_pipeline(fexec, workers):
     f0 = fexec.map(stage0_segment, [workers])
     segs = fexec.get_result(fs=f0)[0]
 
-    f1 = fexec.map(stage1_extract, segs)
+    f1 = fexec.map(stage1_extract, [{'seg': s} for s in segs])
     fexec.get_result(fs=f1)
 
-    f2 = fexec.map(stage2_enhance, segs)
+    f2 = fexec.map(stage2_enhance, [{'seg': s} for s in segs])
     fexec.get_result(fs=f2)
 
-    f3 = fexec.map(stage3_analyze, segs)
+    f3 = fexec.map(stage3_analyze, [{'seg': s} for s in segs])
     fexec.get_result(fs=f3)
 
     return list(f0) + list(f1) + list(f2) + list(f3)
