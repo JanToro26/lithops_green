@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-App 2/4 (Inigo Arriazu): Titanic (analitica de datos + entrenamiento).
+App 2/4 (Inigo Arriazu): Titanic (data analytics + training).
 
-Mix of CPU-bound (training) and memory-bound tasks. Each worker trains a Random Forest
-(n_jobs=1, to avoid mixing multi-threading with multi-process parallelism) on
-its own synthetic data chunk of fixed size -> strong scaling scenario
-(more workers = more total data processed). Returns the accuracy (for monitoring)
+A mix of CPU (training) and some memory. Each worker trains a Random Forest
+(n_jobs=1, to avoid mixing multi-threading with the multi-process parallelism) on
+its own fixed-size chunk of synthetic data -> strong-scaling scenario (more
+workers = more total data processed). Returns the accuracy (for monitoring only)
 and the number of samples.
 
 Requires: numpy, scikit-learn.
@@ -18,7 +18,7 @@ SAMPLES_PER_WORKER = 80_000   # fixed size per worker (strong scaling)
 
 
 def titanic_worker(chunk_id):
-    """Trains a Random Forest on a synthetic chunk (CPU-bound)."""
+    """Train a Random Forest on a synthetic chunk (CPU-bound)."""
     import numpy as np
     from sklearn.ensemble import RandomForestClassifier
     from sklearn.model_selection import train_test_split
@@ -26,7 +26,7 @@ def titanic_worker(chunk_id):
     rng = np.random.default_rng(chunk_id)
     n = SAMPLES_PER_WORKER
     X = rng.normal(size=(n, 8))
-    # label with signal + noise, for the model to have something to learn
+    # target with signal + noise, so the model has something to learn
     logit = X[:, 0] + 0.5 * X[:, 1] - 0.3 * X[:, 2] + rng.normal(scale=0.5, size=n)
     y = (logit > 0).astype(int)
 
@@ -43,12 +43,12 @@ def make_iterdata(workers):
 def summary(results):
     accs = [r['accuracy'] for r in results]
     total = sum(r['n_samples'] for r in results)
-    return f"{total:,} muestras totales, accuracy media {sum(accs)/len(accs):.3f}"
+    return f"{total:,} total samples, mean accuracy {sum(accs)/len(accs):.3f}"
 
 
 if __name__ == '__main__':
-    # Local: sweep workers only (memory isn't enforced on localhost).
-    # For AWS/K8s, add more memory values to the tuple below.
+    # Local: sweep workers only (memory is not enforced on localhost).
+    # For AWS/K8s, add more values to MEMORY below.
     MEMORY = [1024]
     config_space = [
         {'workers': w, 'memory': m}
@@ -56,4 +56,4 @@ if __name__ == '__main__':
         for w in (1, 2, 4, 8)
     ]
     profile_map('titanic_rf', titanic_worker, make_iterdata, config_space,
-                reduce_fn=summary)
+                reduce_fn=summary, repeats=5)

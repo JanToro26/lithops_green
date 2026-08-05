@@ -2,20 +2,20 @@
 """
 App 1/4 (Inigo Arriazu): Monte Carlo Pi.
 
-Embarrassingly parallel computation with no inter-worker 
-communication. Each worker computes random point evaluations for π estimation. 
-Pure CPU workload. The total number of the points is 100M, this number is split 
-between the number of workers.
+Embarrassingly parallel, pure CPU. TOTAL_POINTS points are split evenly among the
+workers (more workers -> less work per worker, same total work). Each worker
+counts how many points fall inside the quarter circle; pi is estimated from the
+combined count.
 
-    python examples/energy_apps/app_pi_montecarlo.py
+    python examples/energy_apps/app_montecarlo.py
 """
 from energy_report import profile_map
 
-TOTAL_POINTS = 100_000_000
+TOTAL_POINTS = 100_000_000   # as in the thesis
 
 
 def mc_worker(n_points):
-    """Counts points inside the quarter circle (pure CPU)."""
+    """Count points inside the quarter circle (pure CPU)."""
     import random
     inside = 0
     for _ in range(n_points):
@@ -27,7 +27,7 @@ def mc_worker(n_points):
 
 
 def make_iterdata(workers):
-    """Splits TOTAL_POINTS equitatively between the workers."""
+    """Split TOTAL_POINTS evenly among the workers."""
     per = TOTAL_POINTS // workers
     return [per] * workers
 
@@ -38,8 +38,9 @@ def estimate_pi(results):
 
 
 if __name__ == '__main__':
-    # Local: sweep workers only (memory isn't enforced on localhost).
-    # For AWS/K8s, add more memory values to the tuple below.
+    # Config space: grid of workers x memory (same total work per row)
+    # Local: sweep workers only (memory is not enforced on localhost).
+    # For AWS/K8s, add more values to MEMORY below.
     MEMORY = [1024]
     config_space = [
         {'workers': w, 'memory': m}
@@ -47,4 +48,4 @@ if __name__ == '__main__':
         for w in (1, 2, 4, 8)
     ]
     profile_map('montecarlo_pi', mc_worker, make_iterdata, config_space,
-                reduce_fn=estimate_pi)
+                reduce_fn=estimate_pi, repeats=5)

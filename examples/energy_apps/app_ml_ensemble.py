@@ -60,13 +60,18 @@ def stage2_aggregate(results):
             'best_acc': max(accs)}
 
 
-def stage3_test(agg):
-    """Evaluate the ensemble on fresh data (moderate)."""
+def stage3_test(n_models, mean_acc, best_acc):
+    """Evaluate the ensemble on fresh data (moderate).
+
+    Takes the aggregate's fields as explicit params so Lithops passes the dict
+    from stage2 as kwargs (a dict in iterdata whose keys match the params).
+    """
     from sklearn.decomposition import PCA
     from sklearn.ensemble import GradientBoostingClassifier
     X, y = _make_data(999)
     Xr = PCA(n_components=N_COMPONENTS, random_state=0).fit_transform(X)
     clf = GradientBoostingClassifier(n_estimators=50, random_state=0).fit(Xr, y)
+    agg = {'n_models': n_models, 'mean_acc': mean_acc, 'best_acc': best_acc}
     return {'final_score': float(clf.score(Xr, y)), 'ensemble': agg}
 
 
@@ -81,19 +86,19 @@ def run_pipeline(fexec, workers):
     f2 = fexec.map(stage2_aggregate, [r1])   # 1 task receiving the list of results
     r2 = fexec.get_result(fs=f2)
 
-    f3 = fexec.map(stage3_test, [{'agg': r2[0]}])
+    f3 = fexec.map(stage3_test, [r2[0]])
     fexec.get_result(fs=f3)
 
     return list(f0) + list(f1) + list(f2) + list(f3)
 
 
 if __name__ == '__main__':
-    # Local: sweep workers only (memory isn't enforced on localhost).
-    # For AWS/K8s, add more memory values to the tuple below.
+    # Local: sweep workers only (memory is not enforced on localhost).
+    # For AWS/K8s, add more values to MEMORY below.
     MEMORY = [1024]
     config_space = [
         {'workers': w, 'memory': m}
         for m in MEMORY
         for w in (1, 2, 4, 8)
     ]
-    profile_pipeline('ml_ensemble', run_pipeline, config_space)
+    profile_pipeline('ml_ensemble', run_pipeline, config_space, repeats=5)
