@@ -33,7 +33,7 @@ class LocvalhostEnvironment(Enum):
 
 def get_environment(runtime_name):
 
-    windows_path_pattern = re.compile(r'^[A-Za-z]:\\.*$')
+    windows_path_pattern = re.compile(r'^[A-Za-z]:[\\/].*$')
     if runtime_name.startswith(('python', '/')) \
        or windows_path_pattern.match(runtime_name) is not None:
         environment = LocvalhostEnvironment.DEFAULT

@@ -146,7 +146,8 @@ class LocalhostHandlerV2:
         """
         Generate the runtime key that identifies the runtime
         """
-        runtime_key = os.path.join('localhost', __version__, runtime_name.strip("/"))
+        safe_name = runtime_name.replace(':', '').replace('/', '_').replace('\\', '_').strip('_')
+        runtime_key = os.path.join('localhost', __version__, safe_name)
 
         return runtime_key
 

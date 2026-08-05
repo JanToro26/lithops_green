@@ -1,0 +1,6 @@
+lithops:
+    backend: localhost
+    storage: localhost
+
+localhost:
+    runtime: C:/Users/janto/Documents/TFG/Code/lithops_green/.venv/Scripts/python.exe
