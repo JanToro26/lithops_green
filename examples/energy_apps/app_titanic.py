@@ -47,9 +47,12 @@ def summary(results):
 
 
 if __name__ == '__main__':
+    # Local: sweep workers only (memory isn't enforced on localhost).
+    # For AWS/K8s, add more memory values to the tuple below.
+    MEMORY = [1024]
     config_space = [
         {'workers': w, 'memory': m}
-        for m in (1024, 2048)
+        for m in MEMORY
         for w in (1, 2, 4, 8)
     ]
     profile_map('titanic_rf', titanic_worker, make_iterdata, config_space,

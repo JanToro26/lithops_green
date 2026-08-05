@@ -96,9 +96,12 @@ def run_pipeline(fexec, workers):
 
 
 if __name__ == '__main__':
+    # Local: sweep workers only (memory isn't enforced on localhost).
+    # For AWS/K8s, add more memory values to the tuple below.
+    MEMORY = [1024]
     config_space = [
         {'workers': w, 'memory': m}
-        for m in (1024, 2048)
+        for m in MEMORY
         for w in (1, 2, 4, 8)
     ]
     profile_pipeline('video_processing', run_pipeline, config_space)

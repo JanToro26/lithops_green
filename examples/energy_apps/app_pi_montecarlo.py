@@ -38,12 +38,13 @@ def estimate_pi(results):
 
 
 if __name__ == '__main__':
-    # Config space: changing the number of workers (same total workload)
+    # Local: sweep workers only (memory isn't enforced on localhost).
+    # For AWS/K8s, add more memory values to the tuple below.
+    MEMORY = [1024]
     config_space = [
-        {'workers': 1},
-        {'workers': 2},
-        {'workers': 4},
-        {'workers': 8},
+        {'workers': w, 'memory': m}
+        for m in MEMORY
+        for w in (1, 2, 4, 8)
     ]
     profile_map('montecarlo_pi', mc_worker, make_iterdata, config_space,
                 reduce_fn=estimate_pi)
