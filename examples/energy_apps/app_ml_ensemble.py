@@ -81,7 +81,7 @@ def run_pipeline(fexec, workers):
     f2 = fexec.map(stage2_aggregate, [r1])   # 1 task receiving the list of results
     r2 = fexec.get_result(fs=f2)
 
-    f3 = fexec.map(stage3_test, [r2[0]])
+    f3 = fexec.map(stage3_test, [{'agg': r2[0]}])
     fexec.get_result(fs=f3)
 
     return list(f0) + list(f1) + list(f2) + list(f3)

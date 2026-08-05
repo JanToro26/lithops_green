@@ -18,6 +18,8 @@ import copy
 import os
 import json
 import threading
+import time
+from time import time
 import uuid
 import shlex
 import signal
@@ -337,6 +339,12 @@ class DefaultEnvironment(ExecutionEnvironment):
         """
         def kill_process(process):
             if process and process.poll() is None:
+                # Let a worker that's finishing (e.g. energy-monitor teardown)
+                # exit cleanly before force-killing it.
+                for _ in range(50):          # up to ~5s
+                    if process.poll() is not None:
+                        return
+                    time.sleep(0.1)
                 PID = process.pid
                 if self.is_unix_system:
                     PGID = os.getpgid(PID)
