@@ -19,7 +19,6 @@ import os
 import json
 import threading
 import time
-from time import time
 import uuid
 import shlex
 import signal
