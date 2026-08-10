@@ -45,6 +45,7 @@ from lithops.worker.status import create_call_status
 from lithops.worker.utils import SystemMonitor
 
 from lithops.worker.energymonitor import EnergyManager
+from lithops.worker.processor_info import add_processor_info_to_task
 
 pickling_support.install()
 
@@ -202,6 +203,11 @@ def run_task(task):
     # Default cpu_info so the finally block never fails if an exception
     # occurs before sys_monitor collects real metrics.
     cpu_info = {'usage': [], 'user': 0.0, 'system': 0.0}
+
+    # Processor identity. Published before monitoring starts: it is cached, so
+    # the cost is paid once per container rather than inside the measured
+    # window, and the TDP the power model uses becomes auditable per run.
+    add_processor_info_to_task(task, call_status)
 
     # Energy Manager initialization (needs the monitored process id)
     process_id = os.getpid() if is_unix_system() else mp.current_process().pid
