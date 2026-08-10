@@ -4,7 +4,48 @@ import logging
 import platform
 import threading
 
+from lithops.worker.processor_info import get_processor_info, resolve_tdp
+
 logger = logging.getLogger(__name__)
+
+# Split of package TDP into a static floor and a load-proportional range.
+#
+# These are PLACEHOLDERS to be replaced by the cluster calibration run; they
+# are named here so there is exactly one place to change them afterwards.
+# Until then, every absolute joule figure from this monitor inherits them.
+#
+# How to fit each one, and when it must be revisited:
+#
+#   IDLE_FRACTION -- directly measurable. Read RAPL package energy over a known
+#     window at near-zero utilisation: IDLE_FRACTION = (E/t) / TDP. Do not
+#     carry a value across CPU families; idle draw depends on the part and on
+#     which C-states the platform actually enters.
+#
+#   DYNAMIC_FRACTION -- fit as the slope of package power against utilisation.
+#     It is NOT constrained to equal 1 - IDLE_FRACTION. That identity assumes
+#     P(100%) == TDP exactly, which is false in both directions: packages
+#     exceed TDP under short-term turbo/PL2, and rarely reach it on non-AVX
+#     workloads. Nothing in this file couples the two, and nothing should.
+#
+#   CORES_FRACTION_OF_PKG -- prefer measuring over fitting. RAPL exposes the
+#     core/pp0 subdomain separately from the package, so on any host with RAPL
+#     this ratio is an observation, not a parameter. It is only needed where
+#     RAPL is absent (Lambda), and should be carried over from the calibration
+#     host of the same microarchitecture rather than assumed.
+#
+# Revisit them when: (a) the calibration run completes; (b) you move to a
+# different CPU family -- Graviton, Xeon and EPYC will not share values; or
+# (c) the psutil_vs_rapl_pct column in profiling_avg.csv shows structure. A
+# roughly constant offset points at IDLE_FRACTION; an offset that grows with
+# utilisation points at DYNAMIC_FRACTION; an offset that tracks neither means
+# the model's shape is wrong and no choice of constants will fix it.
+#
+# LIMITATION: these are module-level globals, so all CPUs share one set. If
+# calibration yields materially different values per family, they belong
+# alongside the watts in processor_info._TDP_TABLE, not here.
+IDLE_FRACTION = 0.15
+DYNAMIC_FRACTION = 0.85
+CORES_FRACTION_OF_PKG = 0.75
 
 
 class EnergyMonitor:
@@ -30,11 +71,34 @@ class EnergyMonitor:
         self._sample_interval = 0.5
         
         # --- Hardware Discovery ---
-        self.arch = platform.machine().lower() # e.g., 'x86_64' or 'aarch64'
-        self.cpu_model = self._get_cpu_model()
-        self.base_tdp = self._assign_tdp()
-        
-        logger.info(f"Monitor initialized: Arch={self.arch}, CPU={self.cpu_model}, TDP_Ref={self.base_tdp}W")
+        # Resolved once, from processor_info (cached), instead of re-probing
+        # /proc/cpuinfo and py-cpuinfo on every invocation.
+        self.processor_info = get_processor_info()
+        self.arch = (self.processor_info.get("architecture") or platform.machine()).lower()
+        self.cpu_model = self.processor_info.get("processor_name") or "Unknown"
+
+        tdp = resolve_tdp(self.processor_info)
+        self.base_tdp = tdp["tdp_w"]
+        self.tdp_source = tdp["tdp_source"]
+        self.tdp_is_default = tdp["is_default"]
+
+        try:
+            import psutil
+
+            self.n_logical = psutil.cpu_count(logical=True) or 1
+        except Exception:
+            self.n_logical = self.processor_info.get("threads") or 1
+
+        if self.tdp_is_default:
+            logger.warning(
+                f"TDP for '{self.cpu_model}' (arch={self.arch}) could not be resolved; "
+                f"falling back to {self.base_tdp}W. Modelled energy from this worker "
+                f"rests on an unverified constant."
+            )
+        logger.info(
+            f"Monitor initialized: Arch={self.arch}, CPU={self.cpu_model}, "
+            f"TDP_Ref={self.base_tdp}W ({self.tdp_source}), n_logical={self.n_logical}"
+        )
         
     def start(self):
         """Start collecting initial system metrics using PSUtil."""
@@ -43,11 +107,12 @@ class EnergyMonitor:
         try:
             import psutil
             
-            self.start_time = time.time()
-            
-            # Initialize CPU percent measurement (non-blocking)
-            psutil.cpu_percent(interval=None) 
+            # Metrics are collected BEFORE the clock starts. The previous order
+            # placed extra seconds of blocking sleep inside the measured window, which
+            # was then multiplied by idle power and charged to the function.
+            psutil.cpu_percent(interval=None)
             self.initial_metrics = self._collect_system_metrics()
+            self.start_time = time.time()
 
             try:
                 self._proc = psutil.Process(self.process_id)
@@ -89,15 +154,18 @@ class EnergyMonitor:
             logger.warning("PSUtil monitoring was not started")
             return
 
+        # Stamp the end of the measured window first. Joining the sampler
+        # thread can block for a determinate number of seconds; counting
+        # that as function time inflated duration, and therefore energy.
+        self.end_time = time.time()
+
         self._sampling = False
         if self._sampler_thread is not None:
             self._sampler_thread.join(timeout=self._sample_interval * 2 + 1)
-            
+
         try:
             import psutil
-            
-            self.end_time = time.time()
-            
+
             # Collect final system metrics
             self.final_metrics = self._collect_system_metrics()
             
@@ -143,11 +211,12 @@ class EnergyMonitor:
             
             # === SYSTEM-WIDE METRICS ===
             try:
-                # CPU usage - use non-blocking call first, then blocking call for accurate measurement
-                # First call initializes the measurement, second call gets the actual usage
-                psutil.cpu_percent(interval=None)  # Non-blocking call to initialize
-                time.sleep(0.5)  # Wait a bit for meaningful measurement
-                cpu_percent = psutil.cpu_percent(interval=None)  # Get the actual measurement
+                # Non-blocking. psutil.cpu_percent(interval=None) reports usage
+                # since the previous call, so calling it at start and at stop
+                # yields the average over the function window at zero cost.
+                # The former sleep(0.5) here ran twice per invocation and, on
+                # Lambda, would be billed and charged to the energy measurement.
+                cpu_percent = psutil.cpu_percent(interval=None)
                 metrics['system_cpu_percent'] = cpu_percent
                 
                 # Also get per-CPU percentages for more detailed analysis
@@ -216,9 +285,7 @@ class EnergyMonitor:
             try:
                 process = psutil.Process(self.process_id)
                 
-                # Process CPU and memory - use non-blocking for process too
-                process.cpu_percent()  # Initialize measurement
-                time.sleep(0.2)  # Short wait for process measurement
+                # Non-blocking, same reasoning as system_cpu_percent above.
                 process_cpu = process.cpu_percent()
                 metrics['process_cpu_percent'] = process_cpu
                 
@@ -418,90 +485,128 @@ class EnergyMonitor:
     
     def get_energy_data(self):
         """
-        Calculates estimated energy consumption using an empirical power model.
-        Energy (J) = [P_idle + (P_dynamic * %CPU)] * Duration
+        Estimated energy from an empirical package power model.
+
+            P_pkg(U) = TDP * (IDLE_FRACTION + DYNAMIC_FRACTION * U)
+
+        where U is *package* utilisation in [0, 1].
+
+        Attribution across concurrent workers
         """
-        import psutil
         duration = self.end_time - self.start_time if self.start_time and self.end_time else 0
-        
+
         if not self.final_metrics:
             return {'energy': {'pkg': 0, 'cores': 0}, 'duration': duration, 'source': 'none'}
 
+        n_logical = self.n_logical or 1
+
         # Average process CPU% over the whole execution (periodic sampling).
+        # This is a percentage of ONE core, so 250.0 means 2.5 cores busy.
         if self._proc_samples:
             raw_proc_cpu = sum(self._proc_samples) / len(self._proc_samples)
         else:
-            raw_proc_cpu = (self.initial_metrics.get('system_cpu_percent', 0) +
-                            self.final_metrics.get('system_cpu_percent', 0)) / 2.0
-        try:
-            n_logical = psutil.cpu_count(logical=True) or 1
-        except Exception:
-            n_logical = 1
-        avg_cpu = min(100.0, raw_proc_cpu / n_logical)
-        
-        # Empirical Power Model
-        # We assume 15% of TDP is base (Idle) and 85% is dynamic range
-        p_idle = self.base_tdp * 0.15
-        p_dynamic = (self.base_tdp * 0.85) * (avg_cpu / 100.0)
-        
-        total_power_w = p_idle + p_dynamic
-        energy_j = total_power_w * duration
+            # Fallback: no per-process samples, so fall back to system-wide CPU.
+            system_pct = self.final_metrics.get('system_cpu_percent', 0) or 0
+            raw_proc_cpu = system_pct * n_logical
+
+        cores_used = raw_proc_cpu / 100.0
+        util_share = min(1.0, cores_used / n_logical)  # this worker's share of the package
+
+        p_idle_machine = self.base_tdp * IDLE_FRACTION          # machine-level, count once
+        p_dynamic = self.base_tdp * DYNAMIC_FRACTION * util_share  # attributable, summable
+
+        energy_dynamic_j = p_dynamic * duration
+        energy_idle_machine_j = p_idle_machine * duration
 
         return {
             'duration': round(duration, 4),
             'source': f'psutil_modeled_{self.arch}',
             'energy': {
-                'pkg': round(energy_j, 6),
-                'cores': round(energy_j * 0.75, 6), # Core estimation (approx 75% of PKG)
-                'avg_cpu_percent': round(avg_cpu, 2),
+                # Summable across workers without double-counting idle.
+                'pkg': round(energy_dynamic_j, 6),
+                'cores': round(energy_dynamic_j * CORES_FRACTION_OF_PKG, 6),
+                'pkg_dynamic': round(energy_dynamic_j, 6),
+                # Machine floor for this window. Add ONCE per execution, not per worker.
+                'pkg_idle_machine': round(energy_idle_machine_j, 6),
+                # The pre-fix per-worker value is deliberately NOT emitted. It
+                # equals pkg_dynamic + p_idle_machine_w * duration, so it stays
+                # reconstructible without carrying a known-wrong column.
+                'p_idle_machine_w': round(p_idle_machine, 4),
+                'avg_cpu_percent': round(util_share * 100.0, 2),
                 'proc_cpu_percent': round(raw_proc_cpu, 2),
-                'cpu_samples': len(self._proc_samples)
+                'cores_used': round(cores_used, 4),
+                'util_share': round(util_share, 6),
+                'cpu_samples': len(self._proc_samples),
             },
             'cpu_info': {
                 'model': self.cpu_model,
                 'arch': self.arch,
-                'tdp_ref': self.base_tdp
+                'tdp_ref': self.base_tdp,
+                'tdp_source': self.tdp_source,
+                'tdp_is_default': self.tdp_is_default,
+                'n_logical': n_logical,
+                'idle_fraction': IDLE_FRACTION,
+                'dynamic_fraction': DYNAMIC_FRACTION,
             }
         }
         
     def log_energy_data(self, energy_data, task, cpu_info, function_name=None):
         """
-        Log system monitoring data.
-        NOTE: This does NOT log energy data since PSUtil doesn't measure energy.
+        Log the modelled power/energy summary for this invocation.
+
+        Reads the dict `get_energy_data` actually returns, i.e. its 'energy' and
+        'cpu_info' sub-dicts. The previous version read 'system' and 'process'
+        keys, which belonged to the older resource-metrics-only implementation
+        left commented out above; against the current dict every `.get` missed
+        its default, so the whole summary logged zeros no matter what had been
+        measured.
         """
         if function_name:
             self.function_name = function_name
         
-        logger.info("=== PSUtil System Monitoring Summary ===")
+        logger.info("=== PSUtil Modelled Energy Summary ===")
         
-        system_data = energy_data.get('system', {})
-        process_data = energy_data.get('process', {})
-        cpu_info_data = energy_data.get('cpu_info', {})
+        energy = energy_data.get('energy', {})
+        info = energy_data.get('cpu_info', {})
+        duration = energy_data.get('duration', 0.0)
         
-        # Log system metrics with high precision
-        logger.info(f"System CPU Usage: {system_data.get('cpu_percent', 0):.6f}%")
-        logger.info(f"  - Initial: {system_data.get('cpu_percent_initial', 0):.6f}%, Final: {system_data.get('cpu_percent_final', 0):.6f}%")
-        logger.info(f"  - Per-CPU Initial: {system_data.get('per_cpu_initial', [])}")
-        logger.info(f"  - Per-CPU Final: {system_data.get('per_cpu_final', [])}")
-        logger.info(f"System Memory Usage: {system_data.get('memory_percent', 0):.1f}% ({system_data.get('memory_used_mb', 0):.1f} MB)")
-        logger.info(f"Disk I/O: Read {system_data.get('disk_io_read_mb', 0):.2f} MB, Write {system_data.get('disk_io_write_mb', 0):.2f} MB")
-        logger.info(f"Network I/O: Sent {system_data.get('network_sent_mb', 0):.2f} MB, Received {system_data.get('network_recv_mb', 0):.2f} MB")
+        # The hardware the power model was applied to. The TDP is the model's
+        # most influential input, so it is logged with its resolution status.
+        logger.info(
+            f"CPU: {info.get('model', 'Unknown')} ({info.get('arch', 'Unknown')}), "
+            f"{info.get('n_logical', 0)} logical cores, "
+            f"TDP_ref={info.get('tdp_ref', 0.0)}W"
+            + (" [UNRESOLVED DEFAULT]" if info.get('tdp_is_default', True) else "")
+        )
         
-        # Log process metrics with high precision
-        logger.info(f"Process CPU Usage: {process_data.get('cpu_percent', 0):.6f}%")
-        logger.info(f"  - Initial: {process_data.get('cpu_percent_initial', 0):.6f}%, Final: {process_data.get('cpu_percent_final', 0):.6f}%")
-        logger.info(f"Process Memory Usage: {process_data.get('memory_mb', 0):.1f} MB")
+        # Utilisation actually observed for the monitored process. proc_cpu is a
+        # percentage of ONE core (250% == 2.5 cores busy); util_share is this
+        # worker's share of the whole package, which is what drives the model.
+        logger.info(
+            f"Utilisation: {energy.get('proc_cpu_percent', 0.0):.2f}% of one core "
+            f"({energy.get('cores_used', 0.0):.3f} cores), package share "
+            f"{energy.get('util_share', 0.0) * 100:.2f}%, "
+            f"{energy.get('cpu_samples', 0)} samples"
+        )
         
-        # Log CPU info
-        logger.info(f"CPU: {cpu_info_data.get('brand', 'Unknown')} ({cpu_info_data.get('cores_physical', 0)} physical, {cpu_info_data.get('cores_logical', 0)} logical cores)")
+        # Modelled energy. The idle floor is a property of the host, not of this
+        # worker: count it ONCE per host per window, never once per co-located
+        # worker, or local energy looks superlinear in the worker count.
+        logger.info(
+            f"Energy (modelled): dynamic {energy.get('pkg_dynamic', 0.0):.6f} J, "
+            f"machine idle floor {energy.get('pkg_idle_machine', 0.0):.6f} J "
+            f"(P_idle={energy.get('p_idle_machine_w', 0.0):.2f} W, count once per host)"
+        )
         
-        if system_data.get('cpu_freq_current', 0) > 0:
-            logger.info(f"CPU Frequency: {system_data.get('cpu_freq_current', 0):.0f} MHz")
+        if info.get('tdp_is_default', True):
+            logger.warning(
+                f"TDP for '{info.get('model', 'Unknown')}' was not resolved; the "
+                f"{energy.get('pkg_dynamic', 0.0):.3f} J above rest on a fallback constant."
+            )
         
-        if system_data.get('cpu_temp_celsius', 0) > 0:
-            logger.info(f"CPU Temperature: {system_data.get('cpu_temp_celsius', 0):.1f}°C")
+        logger.info(f"Source: {energy_data.get('source', 'unknown')}")
         
-        logger.info(f"Monitoring Duration: {energy_data.get('duration', 0):.2f} seconds")
+        logger.info(f"Monitoring duration: {duration:.2f} seconds")
         
     def update_function_name(self, task, function_name):
         """Update the function name."""
@@ -531,31 +636,23 @@ class EnergyMonitor:
         return False
 
     def _get_cpu_model(self):
-        """Detects the specific CPU model from the system."""
-        try:
-            # Check for detailed info using py-cpuinfo if available
-            import cpuinfo
-            return cpuinfo.get_cpu_info().get('brand_raw', 'Generic CPU')
-        except ImportError:
-            # Fallback to /proc/cpuinfo
-            if os.path.exists('/proc/cpuinfo'):
-                with open('/proc/cpuinfo', 'r') as f:
-                    for line in f:
-                        if "model name" in line or "Model" in line:
-                            return line.split(":")[1].strip()
-            return platform.processor() or "Unknown"
-        
+        """
+        Deprecated. Kept only so external callers do not break.
+
+        Processor identity now comes from ``processor_info.get_processor_info``,
+        which is cached, handles ARM/Graviton parts that expose no "model name"
+        line, and does not import py-cpuinfo on every invocation.
+        """
+        return get_processor_info().get("processor_name") or platform.processor() or "Unknown"
+
     def _assign_tdp(self):
         """
-        Assigns a Thermal Design Power (TDP) reference based on architecture.
-        Essential for the power model in AWS Lambda environments.
+        Deprecated. Superseded by ``processor_info.resolve_tdp``.
+
+        The old logic returned 95.0 W unless the model string literally
+        contained "Xeon" or "EPYC". On Lambda the string is frequently neither,
+        so the most influential input of the power model defaulted silently and
+        the run gave no indication that it had. ``resolve_tdp`` matches against
+        a sourced table and reports ``is_default`` when it cannot resolve.
         """
-        # Case 1: ARM Architecture (e.g., AWS Graviton2)
-        if 'arm' in self.arch or 'aarch64' in self.arch:
-            return 65.0  # Graviton2 typically has lower TDP per core/node
-        
-        # Case 2: x86 Architecture (Intel/AMD)
-        if "Xeon" in self.cpu_model or "EPYC" in self.cpu_model:
-            return 125.0  # Standard high-performance server CPU
-        
-        return 95.0  # Default for standard instances
+        return resolve_tdp(self.processor_info)["tdp_w"]

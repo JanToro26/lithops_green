@@ -29,6 +29,25 @@ class EnergyManager:
         # Initialize each monitoring method
         self._initialize_monitors()
 
+    @staticmethod
+    def _perf_enabled():
+        """
+        perf is opt-in via LITHOPS_ENERGY_PERF=1.
+
+        It is off by default because `perf stat -a` measures the WHOLE machine,
+        needs elevated perf_event_paranoid, and is unavailable on Lambda. It is
+        worth enabling for the cluster calibration run, where it provides an
+        independent check on RAPL: with a single mechanism, a systematic RAPL
+        offset would propagate into the fitted power-model constants and from
+        there into every derived figure, with nothing to reveal it.
+
+        Scope is system-wide: W workers on one host each report the SAME
+        machine energy, so summing worker_func_perf_energy_pkg multiplies real
+        consumption by W. Every record carries worker_func_perf_scope='system';
+        consumers must take one representative value, never a sum.
+        """
+        return os.environ.get('LITHOPS_ENERGY_PERF', '').strip().lower() in ('1', 'true', 'yes', 'on')
+
     def _initialize_monitors(self):
         """Initialize all available energy monitoring methods."""
         monitor_configs = {
@@ -41,6 +60,13 @@ class EnergyManager:
                 'module': 'lithops.worker.energymonitor_psutil'
             }
         }
+
+        if self._perf_enabled():
+            monitor_configs['perf'] = {
+                'class': 'EnergyMonitor',
+                'module': 'lithops.worker.energymonitor_perf'
+            }
+            logger.info("perf energy monitor enabled via LITHOPS_ENERGY_PERF")
 
         for method_name, config in monitor_configs.items():
             try:
@@ -144,7 +170,16 @@ class EnergyManager:
     def process_energy_data(self, task, call_status, cpu_info):
         """Process energy data from all monitors and add to call status."""
         avg_cpu_usage = sum(cpu_info['usage']) / len(cpu_info['usage']) if cpu_info['usage'] else 0
-        energy_consumption = avg_cpu_usage * round(cpu_info['user'], 8)
+
+        # `worker_func_energy_consumption` used to be
+        #     avg_cpu_usage * round(cpu_info['user'], 8)
+        # but cpu_info['user'] comes from psutil.cpu_times(), which is
+        # SYSTEM-WIDE CPU seconds accumulated since boot -- not this function's
+        # CPU time. That product was a percentage multiplied by host uptime: not
+        # Joules, not comparable between runs, and growing with how long the
+        # machine happened to have been up. It is filled in after the monitor
+        # loop below, from the best mechanism that actually reported.
+        energy_consumption = 0.0
 
         energy_fields = {
             'worker_func_energy_duration': 0.0,
@@ -163,6 +198,24 @@ class EnergyManager:
             'worker_func_psutil_cpu_model': 'Unknown',
             'worker_func_psutil_cpu_architecture': 'Unknown',
             'worker_func_psutil_cpu_tdp_ref': 0.0,
+            # Attribution metadata for the corrected power model. energy_pkg is
+            # now the dynamic (attributable) share only; the machine idle floor
+            # must be added ONCE per execution, not once per worker.
+            'worker_func_psutil_energy_pkg_dynamic': 0.0,
+            'worker_func_psutil_energy_pkg_idle_machine': 0.0,
+            'worker_func_psutil_p_idle_machine_w': 0.0,
+            'worker_func_psutil_cores_used': 0.0,
+            'worker_func_psutil_util_share': 0.0,
+            'worker_func_psutil_n_logical': 0,
+            'worker_func_psutil_cpu_tdp_source': 'unresolved',
+            'worker_func_psutil_cpu_tdp_is_default': True,
+            # perf (opt-in, cluster calibration only)
+            'worker_func_perf_energy_pkg': 0.0,
+            'worker_func_perf_energy_cores': 0.0,
+            'worker_func_perf_energy_total': 0.0,
+            'worker_func_perf_source': 'unavailable',
+            'worker_func_perf_available': False,
+            'worker_func_perf_scope': 'none',
             'worker_func_avg_cpu_usage': avg_cpu_usage,
             'worker_func_energy_consumption': energy_consumption,
         }
@@ -181,7 +234,12 @@ class EnergyManager:
                     energy = energy_data.get('energy', {})
                     pkg_energy = energy.get('pkg', 0.0)
                     cores_energy = energy.get('cores', 0.0)
-                    total_energy = pkg_energy + cores_energy if (pkg_energy > 0 or cores_energy > 0) else 0.0
+                    # `cores` (RAPL PP0 / power/energy-cores/) is a SUBDOMAIN of
+                    # `pkg`, not a sibling: the package counter already includes
+                    # the cores' consumption, so summing them double-counts core
+                    # energy. The package reading IS the total; cores is only a
+                    # fallback for a host that exposes no package domain.
+                    total_energy = pkg_energy if pkg_energy > 0 else cores_energy
                     source = energy_data.get('source', 'unknown')
 
                     if method_name == 'rapl':
@@ -190,6 +248,18 @@ class EnergyManager:
                         energy_fields['worker_func_rapl_energy_total'] = total_energy
                         energy_fields['worker_func_rapl_source'] = source
                         energy_fields['worker_func_rapl_available'] = True
+
+                    elif method_name == 'perf':
+                        energy_fields['worker_func_perf_energy_pkg'] = pkg_energy
+                        energy_fields['worker_func_perf_energy_cores'] = cores_energy
+                        energy_fields['worker_func_perf_energy_total'] = total_energy
+                        energy_fields['worker_func_perf_source'] = source
+                        energy_fields['worker_func_perf_available'] = True
+                        # `perf stat -a` counts the whole package, so every
+                        # concurrent worker reports the SAME machine energy.
+                        # Aggregators must take one representative value, never
+                        # a sum, or the total scales with the worker count.
+                        energy_fields['worker_func_perf_scope'] = 'system'
 
                     elif method_name == 'psutil':
                         cpu_info_data = energy_data.get('cpu_info', {})
@@ -203,7 +273,21 @@ class EnergyManager:
                         energy_fields['worker_func_psutil_cpu_model'] = cpu_info_data.get('model', 'Unknown')
                         energy_fields['worker_func_psutil_cpu_architecture'] = cpu_info_data.get('arch', energy_fields['worker_func_psutil_cpu_architecture'])
                         energy_fields['worker_func_psutil_cpu_tdp_ref'] = cpu_info_data.get('tdp_ref', 0.0)
+                        energy_fields['worker_func_psutil_cpu_tdp_source'] = cpu_info_data.get('tdp_source', 'unresolved')
+                        energy_fields['worker_func_psutil_cpu_tdp_is_default'] = cpu_info_data.get('tdp_is_default', True)
+                        energy_fields['worker_func_psutil_n_logical'] = cpu_info_data.get('n_logical', 0)
+                        energy_fields['worker_func_psutil_energy_pkg_dynamic'] = energy.get('pkg_dynamic', 0.0)
+                        energy_fields['worker_func_psutil_energy_pkg_idle_machine'] = energy.get('pkg_idle_machine', 0.0)
+                        energy_fields['worker_func_psutil_p_idle_machine_w'] = energy.get('p_idle_machine_w', 0.0)
+                        energy_fields['worker_func_psutil_cores_used'] = energy.get('cores_used', 0.0)
+                        energy_fields['worker_func_psutil_util_share'] = energy.get('util_share', 0.0)
                         logger.info(f"Collected CPU info from PSUtil: {energy_fields['worker_func_psutil_cpu_model']}")
+                        if energy_fields['worker_func_psutil_cpu_tdp_is_default']:
+                            logger.warning(
+                                "psutil power model used an UNRESOLVED default TDP "
+                                f"({energy_fields['worker_func_psutil_cpu_tdp_ref']}W) for "
+                                f"'{energy_fields['worker_func_psutil_cpu_model']}'"
+                            )
 
                     try:
                         monitor.log_energy_data(energy_data, task, cpu_info, self.function_name)
@@ -215,6 +299,18 @@ class EnergyManager:
 
         energy_fields['worker_func_energy_duration'] = max_duration
 
+        # Canonical energy for this invocation, in Joules. Prefer a hardware
+        # counter over a modelled estimate, in the same preference order as
+        # flexecutor's StageFuture._select_energy, so the two never disagree
+        # about which mechanism won. `worker_func_energy_method_used` records
+        # which monitors ran; this field records which one the number came from.
+        for _pkg_key in ('worker_func_rapl_energy_pkg',
+                         'worker_func_perf_energy_pkg',
+                         'worker_func_psutil_energy_pkg'):
+            if energy_fields[_pkg_key] > 0:
+                energy_fields['worker_func_energy_consumption'] = energy_fields[_pkg_key]
+                break
+
         for field_name, field_value in energy_fields.items():
             call_status.add(field_name, field_value)
 
@@ -222,7 +318,7 @@ class EnergyManager:
         for key, value in aws_processor_info.items():
             call_status.add(f'worker_func_aws_{key}', value)
 
-        method_order = ['rapl', 'psutil']
+        method_order = ['perf', 'rapl', 'psutil']
         available_methods = []
         for method in method_order:
             if self.monitor_status.get(method, False) and self.monitors.get(method) is not None:
