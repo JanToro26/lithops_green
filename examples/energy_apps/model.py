@@ -91,7 +91,7 @@ def plot(app, points, grid, out_dir, time_budget=None):
                         color='gold', edgecolors='black', zorder=6,
                         label=f'chosen (t<={time_budget}s)')
     plt.xlabel('Workers')
-    plt.ylabel('Energy (J)')
+    plt.ylabel('Energy per work unit (J)')
     plt.title(f'Energy model - {app}')
     plt.legend()
     plt.grid(True, alpha=0.3)

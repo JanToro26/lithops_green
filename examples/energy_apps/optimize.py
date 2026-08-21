@@ -39,7 +39,7 @@ def _num(x, default=None):
         return default
 
 
-def load_points(csv_paths):
+def load_points(csv_paths, metric='per_unit'):
     """Return {app: [ {workers, memory, energy_j, time_s, source}, ... ]}."""
     apps = {}
     for path in csv_paths:
@@ -52,12 +52,15 @@ def load_points(csv_paths):
                     continue
                 rapl = _num(row.get('rapl_pkg_j_mean'), 0.0) or 0.0
                 psu = _num(row.get('psutil_pkg_j_mean'), 0.0) or 0.0
-                energy = rapl if rapl > 0 else psu
                 time_s = _num(row.get('max_duration_s_mean'), 0.0) or 0.0
+                units = _num(row.get('work_units'), 1.0) or 1.0
+                energy_total = rapl if rapl > 0 else psu
                 apps.setdefault(app, []).append({
                     'workers': int(_num(row.get('workers'), 0) or 0),
                     'memory': row.get('memory') or '',
-                    'energy_j': energy,
+                    'work_units': units,
+                    'energy_total_j': energy_total,
+                    'energy_j': energy_total / units if metric == 'per_unit' else energy_total,
                     'time_s': time_s,
                     'source': 'rapl' if rapl > 0 else 'psutil',
                 })
@@ -86,7 +89,9 @@ def greenest_under(points, budget):
 
 
 def _fmt(p):
-    return f"workers={p['workers']:<2} mem={p['memory']:<6} E={p['energy_j']:8.1f}J t={p['time_s']:6.2f}s"
+    return (f"workers={p['workers']:<2} mem={p['memory']:<6} "
+            f"E={p['energy_j']:8.1f} J/u  (total {p['energy_total_j']:8.1f} J, u={p['work_units']:g})  "
+            f"t={p['time_s']:6.2f}s")
 
 
 def report(app, points, time_budget=None):
@@ -147,7 +152,7 @@ def plot(app, points, front, out_dir, time_budget=None):
                         label='chosen (greenest under budget)')
 
     plt.xlabel('Time (s)')
-    plt.ylabel('Energy (J)')
+    plt.ylabel('Energy per work unit (J)')
     plt.title(f'Energy vs time - {app}')
     plt.legend()
     plt.grid(True, alpha=0.3)
@@ -166,13 +171,15 @@ def main():
     ap.add_argument('--time-budget', type=float, default=None,
                     help='seconds; report/plot the greenest config finishing within this time')
     ap.add_argument('--no-plot', action='store_true')
+    ap.add_argument('--metric', choices=['per-unit', 'total'], default='per-unit',
+                    help='normalize energy by work unit (default) or use the total')
     args = ap.parse_args()
 
     csv_paths = args.csv or glob.glob(os.path.join(RESULTS, 'profiling*_avg.csv')) \
         or [os.path.join(RESULTS, 'profiling_avg.csv'),
             os.path.join(RESULTS, 'profiling_flex_avg.csv')]
 
-    apps = load_points(csv_paths)
+    apps = load_points(csv_paths, metric='per_unit' if args.metric == 'per-unit' else 'total')
     if not apps:
         print(f"No profiling data found in: {csv_paths}")
         return
