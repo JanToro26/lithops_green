@@ -101,4 +101,4 @@ if __name__ == '__main__':
         for m in MEMORY
         for w in (1, 2, 4, 8)
     ]
-    profile_pipeline('ml_ensemble', run_pipeline, config_space, repeats=5)
+    profile_pipeline('ml_ensemble', run_pipeline, config_space, repeats=5, work_units=lambda w: w)

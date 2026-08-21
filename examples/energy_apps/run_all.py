@@ -10,6 +10,7 @@ invocation of this script produces the full profiling set.
 import runpy
 import sys
 import os
+import traceback
 
 APPS = ['app_pi_montecarlo.py', 'app_titanic.py', 'app_ml_ensemble.py', 'app_video.py']
 
@@ -21,9 +22,16 @@ def main():
         print(f"\n########## Running {app} ##########")
         try:
             runpy.run_path(path, run_name='__main__')
-        except Exception as e:
-            print(f"!! {app} failed: {e}", file=sys.stderr)
+        except KeyboardInterrupt:
+            raise
+        except BaseException:
+            print(f"!! {app} failed:", file=sys.stderr)
+            traceback.print_exc()
+        except Exception:
+            print(f"!! {app} failed:", file=sys.stderr)
+            traceback.print_exc()
     print("\nAll apps finished.")
+    
 
 
 if __name__ == '__main__':

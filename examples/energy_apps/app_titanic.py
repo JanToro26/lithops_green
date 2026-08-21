@@ -55,5 +55,4 @@ if __name__ == '__main__':
         for m in MEMORY
         for w in (1, 2, 4, 8)
     ]
-    profile_map('titanic_rf', titanic_worker, make_iterdata, config_space,
-                reduce_fn=summary, repeats=5)
+    profile_map('titanic_rf', titanic_worker, make_iterdata, config_space, reduce_fn=summary, repeats=5, work_units=lambda w: w)
