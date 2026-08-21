@@ -63,12 +63,28 @@ class EnergyMonitor:
         self.initial_metrics = {}
         self.final_metrics = {}
 
-        # --- Periodic process CPU sampling ---
+        # --- Process-tree CPU accounting ---
+        # The monitored process is the worker handler, but on Unix the user's
+        # function does NOT run in it: handler.run_task launches the JobRunner
+        # in a child `multiprocessing.Process`. psutil.Process.cpu_percent()
+        # covers one process only, so measuring the handler alone reported the
+        # idle floor and nothing else on every Unix backend (Kubernetes,
+        # Lambda). Windows was unaffected only because the JobRunner is a
+        # Thread there, inside the very process being measured.
+        #
+        # Everything below therefore accounts for the whole process TREE rooted
+        # at process_id. This keeps the measurement window exactly where it was
+        # (handler.py needs no change) and stays correct when several tasks run
+        # concurrently, because each queue-consumer process is the root of its
+        # own subtree.
         self._proc = None
         self._proc_samples = []
         self._sampling = False
         self._sampler_thread = None
         self._sample_interval = 0.5
+        # Cumulative CPU seconds of the tree, sampled at the two window edges.
+        self._cpu_seconds_start = None
+        self._cpu_seconds_end = None
         
         # --- Hardware Discovery ---
         # Resolved once, from processor_info (cached), instead of re-probing
@@ -116,11 +132,12 @@ class EnergyMonitor:
 
             try:
                 self._proc = psutil.Process(self.process_id)
-                self._proc.cpu_percent(None)
             except Exception as e:
                 logger.debug(f"Could not attach to process {self.process_id}: {e}")
                 self._proc = None
             self._proc_samples = []
+            self._cpu_seconds_start = self._tree_cpu_seconds()
+            self._cpu_seconds_end = None
             self._sampling = True
             self._sampler_thread = threading.Thread(target=self._sample_loop, daemon=True)
             self._sampler_thread.start()
@@ -135,17 +152,86 @@ class EnergyMonitor:
             logger.error(f"Error starting PSUtil system monitoring: {e}")
             return False
             
-    def _sample_loop(self):
-        """Background loop: sample the process CPU% every _sample_interval seconds."""
-        while self._sampling:
+    @staticmethod
+    def _own_and_reaped_cpu(proc):
+        """
+        CPU seconds charged to `proc`: its own user+system, plus the user+system
+        of every child it has already waited for.
+
+        The children_* terms are what make the total safe against a child that
+        exits mid-window. While the child lives it is counted through the live
+        walk in _tree_cpu_seconds; the moment the parent reaps it, the same
+        seconds reappear here. There is no interval in which they are counted
+        twice, because children_* only accumulates on wait(), and no interval in
+        which they are lost. On Windows these fields are always zero, which is
+        correct: the JobRunner is a Thread, so the parent's own times cover it.
+        """
+        t = proc.cpu_times()
+        return (
+            float(t.user)
+            + float(t.system)
+            + float(getattr(t, 'children_user', 0.0) or 0.0)
+            + float(getattr(t, 'children_system', 0.0) or 0.0)
+        )
+
+    def _tree_cpu_seconds(self):
+        """
+        Cumulative CPU seconds consumed by the monitored process and all of its
+        descendants, or None if the tree cannot be read.
+
+        The value is monotonic, so the difference between two readings is the
+        CPU time actually consumed between them -- including by processes that
+        started and finished inside the interval.
+        """
+        if self._proc is None:
+            return None
+        try:
+            total = self._own_and_reaped_cpu(self._proc)
+        except Exception as e:
+            logger.debug(f"Could not read CPU times of process {self.process_id}: {e}")
+            return None
+        try:
+            descendants = self._proc.children(recursive=True)
+        except Exception:
+            descendants = []
+        for child in descendants:
             try:
-                if self._proc is not None:
-                    val = self._proc.cpu_percent(interval=self._sample_interval)
-                    self._proc_samples.append(val)
-                else:
-                    time.sleep(self._sample_interval)
+                total += self._own_and_reaped_cpu(child)
             except Exception:
-                time.sleep(self._sample_interval)
+                # The child exited between the listing and the read. Its time is
+                # not lost: it lands in the parent's children_* on the next call.
+                continue
+        return total
+
+    def _sample_loop(self):
+        """
+        Background loop: sample the CPU% of the whole process tree every
+        _sample_interval seconds.
+
+        The samples describe the shape of the utilisation over the execution;
+        the energy figure itself comes from the exact window difference computed
+        in get_energy_data, so a function shorter than one interval still gets a
+        real number instead of falling back to a system-wide estimate.
+        """
+        prev_cpu = self._tree_cpu_seconds()
+        prev_ts = time.time()
+        while self._sampling:
+            time.sleep(self._sample_interval)
+            try:
+                now_cpu = self._tree_cpu_seconds()
+                now_ts = time.time()
+                elapsed = now_ts - prev_ts
+                if prev_cpu is not None and now_cpu is not None and elapsed > 0:
+                    # Percentage of ONE core, the same unit the previous
+                    # Process.cpu_percent() call produced, so everything
+                    # downstream keeps its meaning.
+                    self._proc_samples.append(
+                        max(0.0, now_cpu - prev_cpu) / elapsed * 100.0
+                    )
+                prev_cpu, prev_ts = now_cpu, now_ts
+            except Exception:
+                continue
+
     def stop(self):
         """Stop monitoring and collect final system metrics."""
         logger.debug("Stopping PSUtil system monitoring")
@@ -158,6 +244,12 @@ class EnergyMonitor:
         # thread can block for a determinate number of seconds; counting
         # that as function time inflated duration, and therefore energy.
         self.end_time = time.time()
+        # Read the tree counter at the same instant as the clock. handler.py
+        # calls stop() straight after jrp.join(), so the JobRunner has just been
+        # reaped and its full CPU time is already in the handler's children_*.
+        # Reading here rather than relying on the last periodic sample is what
+        # keeps the final fraction of a second of work from being dropped.
+        self._cpu_seconds_end = self._tree_cpu_seconds()
 
         self._sampling = False
         if self._sampler_thread is not None:
@@ -500,14 +592,34 @@ class EnergyMonitor:
 
         n_logical = self.n_logical or 1
 
-        # Average process CPU% over the whole execution (periodic sampling).
+        # Average CPU% of the monitored process TREE over the whole execution.
         # This is a percentage of ONE core, so 250.0 means 2.5 cores busy.
-        if self._proc_samples:
+        #
+        # Three sources, in decreasing order of fidelity:
+        #   1. the exact CPU seconds consumed between the two window edges,
+        #      which needs no sampling at all and is therefore immune both to a
+        #      function shorter than one sample interval and to sampler jitter;
+        #   2. the mean of the periodic samples, if the edges could not be read;
+        #   3. system-wide CPU, which attributes the whole machine to this
+        #      worker and is a last resort.
+        cpu_source = 'window_delta'
+        if (self._cpu_seconds_start is not None
+                and self._cpu_seconds_end is not None
+                and duration > 0):
+            window_cpu_s = max(0.0, self._cpu_seconds_end - self._cpu_seconds_start)
+            raw_proc_cpu = window_cpu_s / duration * 100.0
+        elif self._proc_samples:
+            cpu_source = 'samples'
             raw_proc_cpu = sum(self._proc_samples) / len(self._proc_samples)
         else:
-            # Fallback: no per-process samples, so fall back to system-wide CPU.
+            cpu_source = 'system_wide'
             system_pct = self.final_metrics.get('system_cpu_percent', 0) or 0
             raw_proc_cpu = system_pct * n_logical
+            logger.warning(
+                "psutil power model fell back to system-wide CPU: the process "
+                "tree could not be read. The utilisation of this worker is not "
+                "distinguishable from the machine's."
+            )
 
         cores_used = raw_proc_cpu / 100.0
         util_share = min(1.0, cores_used / n_logical)  # this worker's share of the package
@@ -537,6 +649,10 @@ class EnergyMonitor:
                 'cores_used': round(cores_used, 4),
                 'util_share': round(util_share, 6),
                 'cpu_samples': len(self._proc_samples),
+                # Which of the three paths above produced raw_proc_cpu.
+                # 'system_wide' means this worker's utilisation could not be
+                # isolated and the figure should not be summed across workers.
+                'cpu_source': cpu_source,
             },
             'cpu_info': {
                 'model': self.cpu_model,
@@ -586,7 +702,8 @@ class EnergyMonitor:
             f"Utilisation: {energy.get('proc_cpu_percent', 0.0):.2f}% of one core "
             f"({energy.get('cores_used', 0.0):.3f} cores), package share "
             f"{energy.get('util_share', 0.0) * 100:.2f}%, "
-            f"{energy.get('cpu_samples', 0)} samples"
+            f"{energy.get('cpu_samples', 0)} samples, "
+            f"source={energy.get('cpu_source', 'unknown')}"
         )
         
         # Modelled energy. The idle floor is a property of the host, not of this

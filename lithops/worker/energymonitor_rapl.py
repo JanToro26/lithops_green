@@ -12,6 +12,12 @@ class EnergyMonitor:
     Energy monitor that uses direct RAPL access via /sys/class/powercap/
     This bypasses the need for perf and perf_event_paranoid restrictions.
     """
+
+    # Domains that must never be added to any total. `psys` is the
+    # platform-level counter and a SUPERSET of the package domains, so counting
+    # it alongside package-N would report the same energy twice.
+    _EXCLUDED_DOMAINS = ('psys',)
+
     def __init__(self, process_id):
         self.process_id = process_id
         self.start_time = None
@@ -23,6 +29,11 @@ class EnergyMonitor:
         self.function_name = None
         self.rapl_pkg_files = []
         self.rapl_cores_files = []
+        # Domains that are neither package nor core (dram, uncore, ...). Kept
+        # for diagnostics only: dram is a sibling of the package, not part of
+        # it, and adding it to a "package energy" figure would change what the
+        # number means.
+        self.rapl_other_files = {}
         self.rapl_max_range = {}   # {ruta_energy_uj: max_energy_range_uj}
         self.start_energy_pkg = {} # dictionaries to hold start and end energy readings for each file
         self.start_energy_cores = {} # this way we can keep track of the real value even after a wrap-around
@@ -35,48 +46,106 @@ class EnergyMonitor:
         # Find available RAPL files
         self._find_rapl_files()
         
+    @staticmethod
+    def _read_sysfs(path):
+        """Read a one-line sysfs attribute, stripped. Raises on failure."""
+        with open(path, 'r') as f:
+            return f.read().strip()
+
     def _find_rapl_files(self):
-        """Find available RAPL energy files."""
-        print("\n==== FINDING RAPL ENERGY FILES ====")
-        
-        # Look for package energy files (main CPU energy)
-        pkg_patterns = [
-            '/sys/class/powercap/intel-rapl:*/energy_uj',
-            '/sys/class/powercap/intel-rapl:*:*/energy_uj'
-        ]
-        
-        for pattern in pkg_patterns:
-            files = glob.glob(pattern)
-            for file in files:
-                try:
-                    # Test if we can read the file
-                    with open(file, 'r') as f:
-                        value = f.read().strip()
-                        int(value)  # Verify it's a valid number
-                        
-                    range_file = file.replace('energy_uj', 'max_energy_range_uj')
-                    try:
-                        with open(range_file, 'r') as f:
-                            self.rapl_max_range[file] = int(f.read().strip())
-                    except Exception:
-                        self.rapl_max_range[file] = None   # or a known default value
-                    
-                    # Determine if it's a package or core file
-                    if ':0:' in file or file.endswith(':0/energy_uj'):
-                        # This is likely a core/uncore file
-                        self.rapl_cores_files.append(file)
-                        print(f"✅ Found RAPL cores file: {file}")
-                    else:
-                        # This is likely a package file
-                        self.rapl_pkg_files.append(file)
-                        print(f"✅ Found RAPL package file: {file}")
-                        
-                except Exception as e:
-                    print(f"❌ Cannot read RAPL file {file}: {e}")
-        
-        print(f"Total RAPL package files: {len(self.rapl_pkg_files)}")
-        print(f"Total RAPL cores files: {len(self.rapl_cores_files)}")
-            
+        """
+        Discover the readable RAPL domains and classify them by what they
+        actually measure.
+
+        Classification reads each domain's `name` attribute ('package-0',
+        'core', 'dram', 'uncore', 'psys'). The previous version inferred the
+        kind from the directory suffix instead, with
+
+            if ':0:' in file or file.endswith(':0/energy_uj'):  -> cores
+
+        which matches `intel-rapl:0`, the PACKAGE of socket 0. On a
+        single-socket host -- every machine in the target cluster -- that left
+        rapl_pkg_files empty, so start() returned False and RAPL never ran at
+        all. The failure was silent: the manager logs a warning and falls
+        through to the modelled estimate, so the run still produces numbers.
+
+        One glob, not two. /sys/class/powercap exposes every domain as a
+        flat entry, so `intel-rapl:*` already covers `intel-rapl:0:1`; the old
+        second pattern re-matched the subdomains, and each one was appended
+        twice. Readings are keyed by realpath so any remaining alias collapses
+        to a single entry.
+        """
+        logger.debug("Discovering RAPL domains under /sys/class/powercap")
+
+        seen = set()
+        for domain_dir in sorted(glob.glob('/sys/class/powercap/intel-rapl:*')):
+            energy_file = os.path.join(domain_dir, 'energy_uj')
+
+            try:
+                canonical = os.path.realpath(energy_file)
+            except OSError:
+                canonical = energy_file
+            if canonical in seen:
+                continue
+
+            try:
+                int(self._read_sysfs(energy_file))
+            except Exception as e:
+                # Unreadable since Linux 5.10, which restricted energy_uj to
+                # root (CVE-2020-8694). Not an error worth raising: the manager
+                # degrades to the next mechanism.
+                logger.debug(f"RAPL counter not readable: {energy_file} ({e})")
+                continue
+            seen.add(canonical)
+
+            try:
+                domain = self._read_sysfs(os.path.join(domain_dir, 'name')).lower()
+            except Exception as e:
+                logger.warning(
+                    f"RAPL domain {domain_dir} exposes no readable 'name'; "
+                    f"skipped rather than guessed ({e})"
+                )
+                continue
+
+            if domain in self._EXCLUDED_DOMAINS:
+                logger.debug(f"Skipping RAPL domain '{domain}' ({domain_dir})")
+                continue
+
+            try:
+                self.rapl_max_range[energy_file] = int(
+                    self._read_sysfs(os.path.join(domain_dir, 'max_energy_range_uj'))
+                )
+            except Exception:
+                # Left as None on purpose. _compute_diff refuses to invent a
+                # wrap range: a fabricated constant would turn a counter wrap
+                # into a plausible-looking but wrong energy figure.
+                self.rapl_max_range[energy_file] = None
+                logger.warning(
+                    f"RAPL domain '{domain}' exposes no max_energy_range_uj; a "
+                    f"counter wrap in this domain cannot be corrected."
+                )
+
+            if domain.startswith('package'):
+                self.rapl_pkg_files.append(energy_file)
+            elif domain == 'core':
+                self.rapl_cores_files.append(energy_file)
+            else:
+                self.rapl_other_files.setdefault(domain, []).append(energy_file)
+            logger.debug(f"RAPL domain '{domain}' -> {energy_file}")
+
+        logger.info(
+            f"RAPL domains found: {len(self.rapl_pkg_files)} package, "
+            f"{len(self.rapl_cores_files)} core, "
+            f"{sum(len(v) for v in self.rapl_other_files.values())} other "
+            f"({', '.join(sorted(self.rapl_other_files)) or 'none'})"
+        )
+        if not self.rapl_pkg_files and self.rapl_cores_files:
+            logger.warning(
+                "No RAPL package domain is readable; core energy will be used "
+                "as the total. It excludes uncore and is therefore a lower bound."
+            )
+
+
     def _read_rapl_energy(self, files):
         """Read energy from RAPL files and return a dict {file: microjoules}."""
         readings = {}
@@ -92,10 +161,13 @@ class EnergyMonitor:
         """Start monitoring energy consumption using RAPL."""
         print("\n==== STARTING RAPL ENERGY MONITORING ====")
         
-        if not self.rapl_pkg_files:
-            print("❌ No RAPL package files found, cannot start monitoring")
+        # Start on ANY readable domain, not on a package domain only. A host
+        # that exposes core but no package is unusual but not useless, and the
+        # manager already resolves the total as `pkg if pkg > 0 else cores`.
+        if not self.rapl_pkg_files and not self.rapl_cores_files:
+            logger.info("No readable RAPL domain; RAPL monitoring disabled")
             return False
-        
+
         try:
             self.start_time = time.time()
             self.start_energy_pkg = self._read_rapl_energy(self.rapl_pkg_files)
@@ -145,11 +217,47 @@ class EnergyMonitor:
             print(f"❌ Error stopping RAPL monitoring: {e}")
             
     def _compute_diff(self, start_readings, end_readings):
+        """
+        Sum the per-domain energy consumed between the two readings, in
+        microjoules, correcting each domain's own counter wrap.
+
+        Three failure modes that previously raised inside get_energy_data --
+        where the exception was caught and turned into a zero -- are handled
+        explicitly here:
+
+          * a domain present at stop but not at start (KeyError). It is skipped:
+            a partial interval cannot be attributed to this window.
+          * a wrap in a domain whose max_energy_range_uj was unreadable
+            (TypeError on None). It is skipped and warned about, rather than
+            corrected with an invented range.
+          * a wrap that even the domain's own range cannot explain, which means
+            more than one wrap occurred and the true value is unrecoverable.
+        """
         total = 0
-        for file in end_readings:
-            diff = end_readings[file] - start_readings[file]
+        for file, end_value in end_readings.items():
+            start_value = start_readings.get(file)
+            if start_value is None:
+                logger.warning(
+                    f"RAPL domain {file} has no start reading; excluded from this window"
+                )
+                continue
+
+            diff = end_value - start_value
             if diff < 0:
-                diff += self.rapl_max_range[file]
+                max_range = self.rapl_max_range.get(file)
+                if max_range is None:
+                    logger.warning(
+                        f"RAPL counter {file} wrapped and its max_energy_range_uj "
+                        f"is unknown; excluded from this window"
+                    )
+                    continue
+                diff += max_range
+                if diff < 0:
+                    logger.warning(
+                        f"RAPL counter {file} wrapped more than once; excluded "
+                        f"from this window"
+                    )
+                    continue
             total += diff
         return total
 
@@ -255,5 +363,3 @@ class EnergyMonitor:
         update_function_name(task, function_name)
     
     '''
-    
-    
