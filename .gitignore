@@ -12,6 +12,7 @@ lithops_*.zip
 *.coverage*
 *.png
 *_config
+*.bak2
 
 # Virtual environments
 .env
