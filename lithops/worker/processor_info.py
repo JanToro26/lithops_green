@@ -373,6 +373,9 @@ _TDP_TABLE = [
      "against your own source before relying on this"),
     ("epyc 7r13", 280.0, "[B] AMD EPYC 7R13, AWS custom Milan (c6a); 280W"),
     ("epyc 7r32", 280.0, "[B] AMD EPYC 7R32, AWS custom Rome (c5a); 280W"),
+    ("ryzen 7 5800h", 45.0,
+     "[A] AMD Ryzen 7 5800H (Cezanne, Zen 3, 8C/16T mobile); AMD default TDP "
+     "45W. Development host"),
     ("xeon platinum 8488c", 385.0,
      "[B] Intel Xeon Platinum 8488C, AWS custom Sapphire Rapids; 385W. "
      "DISPUTED: 350W is also reported, matching the comparable 8480+/8480C. "
