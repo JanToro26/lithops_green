@@ -199,6 +199,7 @@ class ExecutionEnvironment:
         self.work_queue = queue.Queue()
         self.is_unix_system = is_unix_system()
         self.task_processes = {}
+        self.task_processes_lock = threading.Lock()
         self.consumer_threads = []
         self.jobs = {}
 
@@ -325,11 +326,13 @@ class DefaultEnvironment(ExecutionEnvironment):
         logger.debug(f"Going to execute task process {job_key_call_id}")
         cmd = [self.runtime_name, RUNNER_FILE, 'run_job', task_filename]
         process = sp.Popen(cmd, stdout=sp.PIPE, stderr=sp.PIPE, start_new_session=True)
-        self.task_processes[job_key_call_id] = process
+        with self.task_processes_lock:
+            self.task_processes[job_key_call_id] = process
         process.communicate()  # blocks until the process finishes
         if process.returncode != 0:
             logger.error(f"Task process {job_key_call_id} failed with return code {process.returncode}")
-        del self.task_processes[job_key_call_id]
+        with self.task_processes_lock:
+            self.task_processes.pop(job_key_call_id, None)
         logger.debug(f"Task process {job_key_call_id} finished")
 
     def stop(self, job_keys=None):
@@ -338,12 +341,6 @@ class DefaultEnvironment(ExecutionEnvironment):
         """
         def kill_process(process):
             if process and process.poll() is None:
-                # Let a worker that's finishing (e.g. energy-monitor teardown)
-                # exit cleanly before force-killing it.
-                for _ in range(50):          # up to ~5s
-                    if process.poll() is not None:
-                        return
-                    time.sleep(0.1)
                 PID = process.pid
                 if self.is_unix_system:
                     PGID = os.getpgid(PID)
@@ -351,16 +348,32 @@ class DefaultEnvironment(ExecutionEnvironment):
                 else:
                     os.kill(PID, signal.SIGTERM)
 
-        job_keys_to_stop = job_keys or list(self.jobs.keys())
-        for job_key in job_keys_to_stop:
+        job_keys_to_stop = set(job_keys or list(self.jobs.keys()))
+
+        # Atomically take ownership of the processes to stop, so the consumer
+        # threads can keep removing their own entries while we tear down.
+        with self.task_processes_lock:
+            processes_to_stop = []
             for job_key_call_id in list(self.task_processes.keys()):
-                if job_key_call_id.rsplit('-', 1)[0] == job_key:
-                    process = self.task_processes[job_key_call_id]
-                    try:
-                        kill_process(process)
-                    except Exception:
-                        pass
-                    self.task_processes[job_key_call_id] = None
+                if job_key_call_id.rsplit('-', 1)[0] in job_keys_to_stop:
+                    process = self.task_processes.pop(job_key_call_id, None)
+                    if process is not None:
+                        processes_to_stop.append(process)
+
+        # Let workers that are finishing (e.g. energy-monitor teardown) exit
+        # cleanly before force-killing them: wait once for all of them
+        # (~5s total) instead of ~5s per process.
+        deadline = time.time() + 5
+        while processes_to_stop and time.time() < deadline:
+            if all(process.poll() is not None for process in processes_to_stop):
+                break
+            time.sleep(0.1)
+
+        for process in processes_to_stop:
+            try:
+                kill_process(process)
+            except Exception:
+                pass
 
         super().stop(job_keys)
 
@@ -446,10 +459,13 @@ class ContainerEnvironment(ExecutionEnvironment):
         cmd += f'run_job {docker_task_filename}"'
 
         process = sp.Popen(shlex.split(cmd), stdout=sp.PIPE, stderr=sp.PIPE, start_new_session=True)
-        self.task_processes[job_key_call_id] = process
+        with self.task_processes_lock:
+            self.task_processes[job_key_call_id] = process
         process.communicate()  # blocks until the process finishes
         if process.returncode != 0:
             logger.error(f"Task process {job_key_call_id} failed with return code {process.returncode}")
+        with self.task_processes_lock:
+            self.task_processes.pop(job_key_call_id, None)
         logger.debug(f"Task process {job_key_call_id} finished")
 
     def stop(self, job_keys=None):
