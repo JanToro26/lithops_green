@@ -45,7 +45,8 @@ def load_points(csv_paths, metric='per_unit'):
     for path in csv_paths:
         if not os.path.exists(path):
             continue
-        with open(path, newline='') as f:
+        # utf-8-sig: tolerate a BOM if the CSV has been through Excel.
+        with open(path, newline='', encoding='utf-8-sig') as f:
             for row in csv.DictReader(f):
                 app = row.get('app')
                 if not app:

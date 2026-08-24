@@ -47,7 +47,7 @@ AVG_HEADER = [
     'psutil_pkg_j_mean', 'psutil_pkg_j_std', 'psutil_pkg_j_cv_pct',
     'psutil_dynamic_j_mean', 'psutil_idle_j_mean',
     'rapl_pkg_j_mean', 'rapl_pkg_j_std', 'perf_pkg_j_mean',
-    'psutil_j_per_unit', 'rapl_j_per_unit',
+    'psutil_j_per_unit', 'rapl_j_per_unit', 'psutil_vs_rapl_pct',
     'max_duration_s_mean', 'max_duration_s_std',
     'wall_s_mean', 'avg_cpu_pct_mean',
     'tdp_w', 'tdp_default', 'cpu_model', 'method',
@@ -194,7 +194,10 @@ def write_averaged(raw_path, avg_path):
         return [v for v in (_num(r.get(name), None) for r in items) if v is not None]
 
     groups = {}
-    with open(raw_path, newline='') as f:
+    # utf-8-sig tolerates a leading BOM, which Excel writes if the CSV is opened
+    # and saved there. Without it the first field name parses as '﻿"app"'
+    # and every lookup by column name fails.
+    with open(raw_path, newline='', encoding='utf-8-sig') as f:
         reader = csv.DictReader(f)
         if not reader.fieldnames or reader.fieldnames[0] != 'app':
             raise SystemExit(
@@ -228,6 +231,12 @@ def write_averaged(raw_path, avg_path):
             'perf_pkg_j_mean': round(_mean(col(items, 'perf_pkg_j')), 3),
             'psutil_j_per_unit': round(psu_m / units, 3),
             'rapl_j_per_unit': round(rapl_m / units, 3),
+            # Cross-check between the modelled and the measured mechanism. A gap
+            # that varies with configuration means the fitted power-model
+            # constants are absorbing a systematic error. Zero while RAPL is
+            # unavailable, since there is nothing to compare against.
+            'psutil_vs_rapl_pct': (round(100 * (psu_m - rapl_m) / rapl_m, 2)
+                                   if rapl_m else 0.0),
             'max_duration_s_mean': round(_mean(dur), 3),
             'max_duration_s_std': round(_std(dur), 3),
             'wall_s_mean': round(_mean(col(items, 'wall_s')), 3),
