@@ -20,16 +20,25 @@ reads. Requires: numpy.
 """
 from energy_report import profile_pipeline
 
-TOTAL_FRAMES = 240
+TOTAL_FRAMES = 1200
 FRAME_H = 240
 FRAME_W = 320
 
 
 def _frames_for_segment(seg_id, start, end):
-    """Deterministically generate the segment's frames as RGB arrays."""
+    """Yield the segment's frames one at a time, deterministic per seg_id.
+
+    A generator rather than one array: rng.normal produces float64, so the
+    batched version allocated 8 bytes per channel for the whole segment at
+    once, about 2.2GB at 1200 frames before the cast to uint8, which the
+    single-worker configuration cannot hold. Peak memory here is one frame.
+    """
     import numpy as np
     rng = np.random.default_rng(seg_id)
-    return np.clip(rng.normal(128, 40, size=(end - start, FRAME_H, FRAME_W, 3)), 0, 255).astype('uint8')
+    for _ in range(end - start):
+        yield np.clip(
+            rng.normal(128, 40, size=(FRAME_H, FRAME_W, 3)), 0, 255
+        ).astype('uint8')
 
 
 def stage0_segment(workers):
@@ -45,8 +54,8 @@ def stage0_segment(workers):
 
 def stage1_extract(seg_id, start, end):
     """Extract (generate) the segment's frames and report the count."""
-    frames = _frames_for_segment(seg_id, start, end)
-    return {'seg_id': seg_id, 'n_frames': int(frames.shape[0])}
+    n = sum(1 for _ in _frames_for_segment(seg_id, start, end))
+    return {'seg_id': seg_id, 'n_frames': n}
 
 
 def stage2_enhance(seg_id, start, end):
@@ -68,15 +77,21 @@ def stage2_enhance(seg_id, start, end):
 def stage3_analyze(seg_id, start, end):
     """Compute per-frame features: mean brightness and edge density."""
     import numpy as np
-    frames = _frames_for_segment(seg_id, start, end)
-    brightness = float(frames.mean())
+    n = 0
+    brightness_sum = 0.0
     edges = 0.0
-    for fr in frames:
+    for fr in _frames_for_segment(seg_id, start, end):
+        n += 1
+        brightness_sum += float(fr.mean())
         gray = fr.mean(axis=2)
         gx = np.abs(np.diff(gray, axis=1)).mean()
         gy = np.abs(np.diff(gray, axis=0)).mean()
         edges += float(gx + gy)
-    return {'seg_id': seg_id, 'brightness': brightness, 'edge_density': edges / len(frames)}
+    # Every frame is the same size, so the mean of the per-frame means is the
+    # overall mean.
+    return {'seg_id': seg_id,
+            'brightness': brightness_sum / n if n else 0.0,
+            'edge_density': edges / n if n else 0.0}
 
 
 def run_pipeline(fexec, workers):
