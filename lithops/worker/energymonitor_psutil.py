@@ -43,8 +43,8 @@ logger = logging.getLogger(__name__)
 # LIMITATION: these are module-level globals, so all CPUs share one set. If
 # calibration yields materially different values per family, they belong
 # alongside the watts in processor_info._TDP_TABLE, not here.
-IDLE_FRACTION = 0.15
-DYNAMIC_FRACTION = 0.85
+IDLE_FRACTION = 0.1065
+DYNAMIC_FRACTION = 1.1547
 CORES_FRACTION_OF_PKG = 0.75
 
 
@@ -101,9 +101,9 @@ class EnergyMonitor:
         try:
             import psutil
 
-            self.n_logical = psutil.cpu_count(logical=True) or 1
+            self.n_logical = psutil.cpu_count(logical=False) or psutil.cpu_count(logical=True) or 1
         except Exception:
-            self.n_logical = self.processor_info.get("threads") or 1
+            self.n_logical = self.processor_info.get("cores") or self.processor_info.get("threads") or 1
 
         if self.tdp_is_default:
             logger.warning(
