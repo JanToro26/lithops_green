@@ -85,6 +85,10 @@ spec:
   template:
     spec:
       restartPolicy: Never
+      volumes:
+        - name: powercap
+          hostPath:
+            path: /sys/class/powercap
       containers:
         - name: "lithops"
           image: "<INPUT>"
@@ -94,6 +98,8 @@ spec:
             - "/lithops/lithopsentry.py"
             - "$(ACTION)"
             - "$(DATA)"
+          securityContext:
+            privileged: true
           env:
             - name: ACTION
               value: ''
@@ -105,6 +111,10 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: status.podIP
+          volumeMounts:
+            - name: powercap
+              mountPath: /sys/class/powercap
+              readOnly: true
           resources:
             requests:
               cpu: '0.2'
