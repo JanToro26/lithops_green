@@ -11,7 +11,8 @@
 #FROM python:3.9-slim-buster
 
 # Python 3.10
-FROM python:3.10-slim-buster
+#FROM python:3.10-slim-buster
+FROM python:3.10-slim-bullseye
 
 RUN apt-get update && apt-get install -y \
         zip redis-server curl \
