@@ -31,6 +31,7 @@ RUN pip install --upgrade setuptools six pip \
         PyYAML \
         kubernetes \
         numpy \
+        scikit-learn \
         cloudpickle \
         ps-mem \
         tblib \
