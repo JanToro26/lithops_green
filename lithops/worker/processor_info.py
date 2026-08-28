@@ -387,6 +387,8 @@ _TDP_TABLE = [
      "(165W occasionally quoted)"),
     ("xeon platinum 8175m", 240.0,
      "[B] Intel Xeon Platinum 8175M (Skylake-SP), AWS custom; 240W"),
+    ("epyc 7502", 360.0,
+         "[A] RAPL files from Cloudlab URV cluster; AMD EPYC 7502; 360W package, 180W per socket"),
 ]
 
 # Used only when nothing above matches. These are ORDER-OF-MAGNITUDE
