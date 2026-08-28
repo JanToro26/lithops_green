@@ -647,6 +647,11 @@ class KubernetesBackend:
 
             job_res['spec']['activeDeadlineSeconds'] = self.k8s_config['runtime_timeout']
             job_res['spec']['parallelism'] = total_workers
+            pin_node = self.k8s_config.get('pin_node')
+            if pin_node:
+                job_res['spec']['template']['spec']['nodeSelector'] = {
+                    'kubernetes.io/hostname': pin_node
+                }
 
             container = job_res['spec']['template']['spec']['containers'][0]
             container['image'] = docker_image_name
