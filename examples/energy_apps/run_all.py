@@ -24,9 +24,6 @@ def main():
             runpy.run_path(path, run_name='__main__')
         except KeyboardInterrupt:
             raise
-        except BaseException:
-            print(f"!! {app} failed:", file=sys.stderr)
-            traceback.print_exc()
         except Exception:
             print(f"!! {app} failed:", file=sys.stderr)
             traceback.print_exc()
