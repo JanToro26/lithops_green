@@ -45,7 +45,8 @@ RUN pip install --upgrade --ignore-installed pip wheel six setuptools \
         cloudpickle \
         ps-mem \
         tblib \
-        psutil
+        psutil \
+        scikit-learn
 
 # Set working directory to function root directory
 WORKDIR ${FUNCTION_DIR}
